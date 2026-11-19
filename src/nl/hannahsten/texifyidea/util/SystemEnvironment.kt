@@ -70,9 +70,19 @@ class SystemEnvironment {
         // This is cached because the value will not change between restarts
         var executableLocationCache = ConcurrentHashMap<String, String?>()
 
-        // Assumes version will be given in the format GNOME Document Viewer 3.34.2
         val evinceVersion: DefaultArtifactVersion by lazy {
-            DefaultArtifactVersion("evince --version".runCommand()?.split(" ")?.lastOrNull() ?: "")
+            parseEvinceVersion("evince --version".runCommand())
+        }
+
+        /**
+         * Parses `evince --version` output, e.g. `GNOME Document Viewer 3.34.2` or `Evince 49.alpha`.
+         * Returns version 0.0 if [output] is null or has no numeric version.
+         */
+        internal fun parseEvinceVersion(output: String?): DefaultArtifactVersion {
+            // DefaultArtifactVersion parses a non-numeric segment like "49.alpha" as 0.0
+            val numericPart = output?.split(" ")?.lastOrNull()
+                ?.let { Regex("""^\d+(\.\d+)*""").find(it)?.value }
+            return DefaultArtifactVersion(numericPart ?: "")
         }
 
         val texinputs by lazy {

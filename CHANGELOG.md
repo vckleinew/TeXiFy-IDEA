@@ -6,6 +6,7 @@
 * Delay UI initialization of the Indent Options Editor to avoid IDE deadlocks
 
 ### Fixed
+* Fix forward and backward search with Evince 49
 * Fix IDE freeze/deadlock during indexing by avoiding coroutine dispatcher blocking in synchronous commands and caching guessed SDK roots (#4504)
 * Fix commas not detected by Grazie, by @hendrikschippers
 * Fix IDE freeze caused by eager PdfViewer resolution, by @EnderGamingz

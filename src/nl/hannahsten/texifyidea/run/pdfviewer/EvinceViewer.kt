@@ -2,12 +2,15 @@ package nl.hannahsten.texifyidea.run.pdfviewer
 
 import com.intellij.openapi.project.Project
 import nl.hannahsten.texifyidea.TexifyBundle
+import org.freedesktop.dbus.connections.impl.DBusConnection
 import org.freedesktop.dbus.connections.impl.DBusConnectionBuilder
 import org.freedesktop.dbus.errors.NoReply
 import org.freedesktop.dbus.errors.ServiceUnknown
 import org.freedesktop.dbus.exceptions.DBusException
 import org.freedesktop.dbus.types.UInt32
 import org.gnome.evince.Daemon
+import org.gnome.evince.Evince49Daemon
+import org.gnome.evince.Evince49Window
 import org.gnome.evince.SyncViewSourcePointStruct
 import org.gnome.evince.Window
 
@@ -20,28 +23,45 @@ import org.gnome.evince.Window
 object EvinceViewer : SystemPdfViewer("Evince", "evince") {
 
     /**
-     * Object path of the Evince daemon. Together with the object name, this allows us to find the
-     * D-Bus object which allows us to execute the FindDocument function, which is exported on the D-Bus
-     * by Evince.
+     * The D-Bus names Evince exports. Evince 49 renamed its namespace from `org.gnome.evince` to `org.gnome.Evince`,
+     * and D-Bus names are case-sensitive.
      */
-    private const val EVINCE_DAEMON_PATH = "/org/gnome/evince/Daemon"
+    private enum class DBusApi(protected val daemonName: String, protected val daemonPath: String, protected val windowPath: String) {
 
-    /**
-     * Object name of the Evince daemon.
-     */
-    private const val EVINCE_DAEMON_NAME = "org.gnome.evince.Daemon"
+        EVINCE_49("org.gnome.Evince.Daemon", "/org/gnome/Evince/Daemon", "/org/gnome/Evince/Window/0") {
+            override fun findDocument(connection: DBusConnection, uri: String): String? =
+                connection.getRemoteObject(daemonName, daemonPath, Evince49Daemon::class.java).FindDocument(uri, true)
 
-    /**
-     * Object path of the Evince daemon. Together with the object name, this allows us to find the
-     * D-Bus object which allows us to execute the FindDocument function, which is exported on the D-Bus
-     * by Evince.
-     */
-    private const val EVINCE_WINDOW_PATH = "/org/gnome/evince/Window/0"
+            override fun syncView(connection: DBusConnection, owner: String, sourceFile: String, line: Int) =
+                connection.getRemoteObject(owner, windowPath, Evince49Window::class.java)
+                    .SyncView(sourceFile, SyncViewSourcePointStruct(line, -1), UInt32(0))
+        },
+
+        LEGACY("org.gnome.evince.Daemon", "/org/gnome/evince/Daemon", "/org/gnome/evince/Window/0") {
+            override fun findDocument(connection: DBusConnection, uri: String): String? =
+                connection.getRemoteObject(daemonName, daemonPath, Daemon::class.java).FindDocument(uri, true)
+
+            override fun syncView(connection: DBusConnection, owner: String, sourceFile: String, line: Int) =
+                connection.getRemoteObject(owner, windowPath, Window::class.java)
+                    .SyncView(sourceFile, SyncViewSourcePointStruct(line, -1), UInt32(0))
+        };
+
+        /**
+         * @return The bus name of the Evince process that has [uri] open, spawning one if needed.
+         * @throws ServiceUnknown if this Evince version does not export this API.
+         */
+        abstract fun findDocument(connection: DBusConnection, uri: String): String?
+
+        abstract fun syncView(connection: DBusConnection, owner: String, sourceFile: String, line: Int)
+    }
 
     /**
      * This variable will hold the latest known Evince process owner. We need to know the owner of the pdf file in order to execute forward search.
      */
     private var processOwner: String? = null
+
+    /** The API that returned [processOwner]. */
+    private var processOwnerApi: DBusApi = DBusApi.EVINCE_49
 
     override fun openFile(pdfPath: String, project: Project, newWindow: Boolean, focusAllowed: Boolean, forceRefresh: Boolean, raiseOnError: Boolean): Pair<Boolean, String> {
         // Opening the file when not already open will lose focus, so we don't want to do that. However, we have to, otherwise manual forward search will not work
@@ -77,16 +97,14 @@ object EvinceViewer : SystemPdfViewer("Evince", "evince") {
             findProcessOwner(outputPath, project)
         }
 
-        if (processOwner != null) {
+        val owner = processOwner
+        if (owner != null) {
             try {
                 // Get DBusConnection
                 DBusConnectionBuilder.forSessionBus().build().use { connection ->
-                    // Get the Object corresponding to the interface and call the functions to the processOwner
-                    val window = connection.getRemoteObject(processOwner, EVINCE_WINDOW_PATH, Window::class.java)
-
                     // Sync the Evince view to the current position
                     try {
-                        window.SyncView(sourceFilePath, SyncViewSourcePointStruct(line, -1), UInt32(0))
+                        processOwnerApi.syncView(connection, owner, sourceFilePath, line)
                         return Pair(true, "")
                     }
                     catch (ignored: NoReply) {
@@ -123,20 +141,22 @@ object EvinceViewer : SystemPdfViewer("Evince", "evince") {
         try {
             // Get DBusConnection
             DBusConnectionBuilder.forSessionBus().build().use { connection ->
-                // Get the Daemon object using its bus name and object path
-                val daemon = connection.getRemoteObject(EVINCE_DAEMON_NAME, EVINCE_DAEMON_PATH, Daemon::class.java)
-
-                // Call the method on the D-Bus by using the function we defined in the Daemon interface
-                // Catch a NoReply, because it is unknown why Evince cannot start so we don't try to fix that
-                try {
-                    processOwner = daemon.FindDocument("file://$pdfFilePath", true)
+                for (api in DBusApi.entries) {
+                    // Catch a NoReply, because it is unknown why Evince cannot start so we don't try to fix that
+                    try {
+                        processOwner = api.findDocument(connection, "file://$pdfFilePath")
+                        processOwnerApi = api
+                        return Pair(true, "")
+                    }
+                    catch (ignored: NoReply) {
+                        return Pair(true, "")
+                    }
+                    catch (ignored: ServiceUnknown) {
+                        // This Evince version exports the other API
+                    }
                 }
-                catch (ignored: NoReply) {}
-                catch (e: ServiceUnknown) {
-                    return Pair(false, TexifyBundle.message("run.notification.evince.update.and.retry"))
-                }
+                return Pair(false, TexifyBundle.message("run.notification.evince.update.and.retry"))
             }
-            return Pair(true, "")
         }
         catch (e: DBusException) {
             return Pair(false, TexifyBundle.message("run.notification.connection.not.established"))

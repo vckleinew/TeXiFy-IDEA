@@ -15,6 +15,7 @@ import nl.hannahsten.texifyidea.util.TexifyCoroutine
 import nl.hannahsten.texifyidea.util.runCommandWithExitCode
 import org.freedesktop.dbus.connections.impl.DBusConnection
 import org.freedesktop.dbus.connections.impl.DBusConnectionBuilder
+import org.gnome.evince.Evince49Window
 import org.gnome.evince.Window
 import java.awt.Frame
 import kotlin.time.Duration.Companion.milliseconds
@@ -30,7 +31,7 @@ object EvinceInverseSearchListener {
 
     private var sessionConnection: DBusConnection? = null
 
-    private var syncSourceHandler: AutoCloseable? = null
+    private var syncSourceHandlers: List<AutoCloseable>? = null
 
     /**
      * Starts a listener which listens for inverse search actions from Evince.
@@ -65,7 +66,7 @@ object EvinceInverseSearchListener {
         }
 
         // Check if we already have a listener
-        if (syncSourceHandler != null) {
+        if (syncSourceHandlers != null) {
             return
         }
 
@@ -90,10 +91,16 @@ object EvinceInverseSearchListener {
      */
     private fun startListening(project: Project) {
         Log.debug("Starting Evince inverse search listener")
-        syncSourceHandler = sessionConnection?.addSigHandler(Window.SyncSource::class.java) { signal ->
-            val filename = signal.sourceFile.replaceFirst("file://".toRegex(), "")
-            syncSource(filename, signal.sourcePoint.line, project)
-        }
+        val connection = sessionConnection ?: return
+        // Subscribe to both namespaces, see EvinceViewer.DBusApi
+        syncSourceHandlers = listOf(
+            connection.addSigHandler(Window.SyncSource::class.java) { signal ->
+                syncSource(signal.sourceFile, signal.sourcePoint.line, project)
+            },
+            connection.addSigHandler(Evince49Window.SyncSource::class.java) { signal ->
+                syncSource(signal.sourceFile, signal.sourcePoint.line, project)
+            },
+        )
     }
 
     /**
@@ -118,11 +125,12 @@ object EvinceInverseSearchListener {
     /**
      * Sync the IDE on the given source file and line number.
      *
-     * @param filePath Full to a file.
+     * @param sourceFileUri Full path to a file, optionally prefixed with `file://`.
      * @param lineNumber Line number in the file.
      */
 
-    private fun syncSource(filePath: String, lineNumber: Int, project: Project) {
+    private fun syncSource(sourceFileUri: String, lineNumber: Int, project: Project) {
+        val filePath = sourceFileUri.replaceFirst("file://".toRegex(), "")
         val command = arrayOf(ideLauncherPath(), "--line", lineNumber.toString(), "\"$filePath\"")
 
         val result = runCommandWithExitCode(*command)
@@ -157,7 +165,7 @@ object EvinceInverseSearchListener {
 
     fun unload() {
         // Remove the listener
-        syncSourceHandler?.close()
+        syncSourceHandlers?.forEach { it.close() }
         // Properly close the connection
         sessionConnection?.close()
     }
